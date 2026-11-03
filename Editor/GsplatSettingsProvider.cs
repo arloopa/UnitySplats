@@ -37,6 +37,23 @@ namespace Gsplat.Editor
             EditorGUILayout.PropertyField(m_gsplatSettings.FindProperty(nameof(GsplatSettings.Materials)));
 
             EditorGUILayout.Space();
+            EditorGUILayout.LabelField("Native Web Sorting", EditorStyles.boldLabel);
+            var nativeSort = m_gsplatSettings.FindProperty(nameof(GsplatSettings.EnableNativeWebSort));
+            EditorGUILayout.PropertyField(nativeSort);
+            using (new EditorGUI.DisabledScope(!nativeSort.boolValue))
+                EditorGUILayout.PropertyField(m_gsplatSettings.FindProperty(nameof(GsplatSettings.NativeWebSortWorkers)));
+            if (nativeSort.boolValue)
+            {
+                EditorGUILayout.HelpBox(
+                    "Requires a Unity 6000+ WebGPU player, native C/C++ multithreading in Player Settings, " +
+                    "shared memory/cross-origin isolation and available precreated workers. Otherwise Web uses " +
+                    "main-thread CPU sorting. CPU-skinned models also use the existing fallback. " +
+                    "Confirm 'Native WebGPU radix sorting active' in the player log. " +
+                    "The pool persists until the page closes; worker-count changes require a page reload.",
+                    MessageType.Info);
+            }
+
+            EditorGUILayout.Space();
             EditorGUILayout.LabelField("Cross-Renderer Sorting", EditorStyles.boldLabel);
             var enableGlobalSortProp = m_gsplatSettings.FindProperty(nameof(GsplatSettings.EnableGlobalSort));
             EditorGUILayout.PropertyField(enableGlobalSortProp,

@@ -26,7 +26,7 @@ UnitySplats is a Unity implementation maintained by ARLOOPA. It is not an offici
 - Spark-packed and uncompressed Unity asset representations.
 - Asynchronous GPU upload with optional rendering during upload.
 - Orthographic cameras, MSAA, cutouts, active source ranges, and XR integration.
-- Runtime graphics-backend selection for Direct3D, Vulkan, Metal, OpenGL, and WebGL 2.
+- Runtime graphics-backend selection for Direct3D, Vulkan, Metal, OpenGL, WebGL 2, and WebGPU.
 
 ## Supported formats
 
@@ -53,12 +53,26 @@ UnitySplats chooses the fastest compatible sorting and rendering path at runtime
 | Android | OpenGL ES 3.1 | Asynchronous CPU sort and portable sampled-texture draw path |
 | macOS, iOS | Metal | GPU radix sort when supported; CPU fallback otherwise |
 | Web | WebGL 2 | Main-thread CPU sort and portable sampled-texture draw path |
+| Web | WebGPU | Optional native-worker CPU radix sort; main-thread fallback; sampled-texture drawing |
 
 The OpenGL ES path uses RGBA8 byte-packed and floating-point sampled textures instead of vertex-stage storage buffers. This avoids driver failures seen when some mobile GPUs report SSBO support but reject Unity's generated `BufferBlock` bindings. OpenGL ES 3.1 is the minimum supported Android OpenGL version.
 
 Maintainer testing has covered multiple Android and Apple devices using OpenGL ES, Vulkan, and Metal, including Samsung and HONOR Android hardware and Meta Quest 3 and Meta Quest 3S headsets. Samsung and HONOR devices were also used to validate the GLES compatibility path. Device drivers still vary, so a listed API is a supported target rather than a guarantee for every GPU/OS combination. Hardware reports are welcome through GitHub Issues.
 
 The WebGL 2 path does not create compute or structured graphics buffers. It stores splat data and draw order in sampled textures and runs the counting sort on Unity's main thread. Use Spark compression and moderate splat counts for Web builds: browser memory limits and synchronous sorting make large uncompressed assets substantially more expensive than on native platforms. Global merge and compute cutouts are unavailable on WebGL.
+
+### WebGPU and native CPU sorting
+
+On Unity 6000+, enable WebGPU and native C/C++ multithreading in Player Settings, then enable **Native Web Sorting > Enable Native Web Sort** in `Project Settings > Gsplat` (off by default). The worker limit defaults to 4 and is capped by available precreated Unity workers. Confirm `Native WebGPU radix sorting active` in the player log. This uses CPU workers, not subgroup-dependent GPU sorting; CPU-skinned models retain the main-thread fallback.
+
+Serve the player page over HTTPS (localhost is fine for development), and set the following HTTP response headers on the player page and worker script responses. COEP is a choice between two options; `credentialless` is shown below. If you choose `require-corp`, simply replace the corresponding line.
+
+```http
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: credentialless
+```
+
+The page must be cross-origin isolated (`crossOriginIsolated === true`); cross-origin resources must also satisfy COEP through appropriate CORS or CORP responses. Missing native capabilities select main-thread sorting after the player starts. A threaded player that cannot start without shared memory needs a separate non-threaded build/loader fallback. Workers persist until the page closes, so reload after changing their count.
 
 ### Sorting limitations
 

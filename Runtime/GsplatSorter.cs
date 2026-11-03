@@ -150,7 +150,12 @@ namespace Gsplat
             CpuSortWorkspace m_idleCpuWorkspace = new();
             CpuSortWorkspace m_activeCpuWorkspace;
             readonly Texture2D m_orderTexture;
-            readonly Color32[] m_orderTextureData;
+            Color32[] m_orderTextureData;
+            GsplatWebNativeSort m_nativeSort;
+            CpuSortResult m_nativeResult;
+            bool m_nativeRejected;
+            bool m_reportedNativeStart;
+            bool m_reportedSkinningFallback;
             readonly int m_capacity;
 
             public GraphicsBuffer OrderBuffer { get; }
@@ -167,8 +172,6 @@ namespace Gsplat
                 m_usesGpuSort = useGpuSort;
                 m_orderTexture = orderTexture;
                 m_capacity = checked((int)count);
-                if (m_orderTexture)
-                    m_orderTextureData = new Color32[checked(m_orderTexture.width * m_orderTexture.height)];
                 if (useGpuSort)
                 {
                     InputKeys = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (int)count, sizeof(uint));
@@ -189,23 +192,15 @@ namespace Gsplat
                     return;
 
                 CancelCpuWork();
+                ReleaseNativeSort();
+                m_nativeRejected = false;
                 CpuAsset = asset;
                 m_cpuCenters = centers ?? Array.Empty<Vector3>();
                 m_cpuGeneration++;
                 m_hasPendingCpuRequest = false;
                 LastCpuRequestedCount = uint.MaxValue;
 
-                // A valid identity order lets streaming assets render immediately while the
-                // first background sort is still running. This method is called from the
-                // renderer's Update path, never from an SRP render callback.
-                var workspace = m_idleCpuWorkspace ?? new CpuSortWorkspace();
-                workspace.EnsureCapacity(m_capacity);
-                for (var i = 0; i < m_capacity; ++i)
-                    workspace.Order[i] = (uint)i;
-                if (m_capacity > 0)
-                    UploadOrder(workspace.Order, m_capacity);
-                m_idleCpuWorkspace = workspace;
-                Initialized = true;
+                InitializeCpuOrder();
             }
 
             public void SetActiveSourceIds(uint[] sourceIds)
@@ -223,9 +218,12 @@ namespace Gsplat
                 m_hasPendingCpuRequest = false;
                 LastCpuRequestedCount = uint.MaxValue;
                 m_activeSourceIds = sourceIds;
-                if (sourceIds.Length > 0)
-                    UploadOrder(sourceIds, sourceIds.Length);
-                Initialized = true;
+                if (m_usesGpuSort)
+                {
+                    if (sourceIds.Length > 0) UploadOrder(sourceIds, sourceIds.Length);
+                    Initialized = true;
+                }
+                else InitializeCpuOrder();
             }
 
             public void ClearActiveSourceIds()
@@ -246,14 +244,7 @@ namespace Gsplat
                     return;
                 }
 
-                var workspace = m_idleCpuWorkspace ?? new CpuSortWorkspace();
-                workspace.EnsureCapacity(m_capacity);
-                for (var i = 0; i < m_capacity; ++i)
-                    workspace.Order[i] = (uint)i;
-                if (m_capacity > 0)
-                    UploadOrder(workspace.Order, m_capacity);
-                m_idleCpuWorkspace = workspace;
-                Initialized = true;
+                InitializeCpuOrder();
             }
 
             public void UnbindCpuCenters()
@@ -262,6 +253,7 @@ namespace Gsplat
                     return;
 
                 CancelCpuWork();
+                ReleaseNativeSort();
                 CpuAsset = null;
                 m_cpuCenters = null;
                 m_activeSourceIds = null;
@@ -286,6 +278,8 @@ namespace Gsplat
                 if (count == 0)
                     return;
 
+                // Coalesce camera-pose updates instead of cancelling each in-flight sort. Hard
+                // source/selection/camera-identity changes are invalidated separately.
                 m_pendingCpuRequest = new CpuSortRequest(m_cpuCenters, m_activeSourceIds, (int)count,
                     m_cpuGeneration, matrixMv, skinning);
                 m_hasPendingCpuRequest = true;
@@ -311,8 +305,13 @@ namespace Gsplat
                 if (m_usesGpuSort || m_disposed)
                     return;
 
+                if (m_nativeSort != null && !GsplatWebNativeSort.Requested)
+                {
+                    ReleaseNativeSort();
+                    LastCpuRequestedCount = uint.MaxValue;
+                }
                 CompleteCpuWork();
-                if (m_cpuTask == null && m_hasPendingCpuRequest)
+                if (m_cpuTask == null && m_nativeSort is not { Running: true } && m_hasPendingCpuRequest)
                     StartCpuWork();
             }
 
@@ -320,6 +319,30 @@ namespace Gsplat
             {
                 var request = m_pendingCpuRequest;
                 m_hasPendingCpuRequest = false;
+
+                if (request.Skinning == null && EnsureNativeSort())
+                {
+                    if (m_nativeSort.TryStart(request.SourceIds, request.Count, request.M20, request.M21, request.M22, request.M23))
+                    {
+                        if (!m_reportedNativeStart)
+                        {
+                            m_reportedNativeStart = true;
+                            Debug.Log($"[GsplatSorter] Native WebGPU radix sorting active: {request.Count:N0} splats; direct RGBA8 order upload, no managed index repacking.");
+                        }
+                        m_nativeResult = new CpuSortResult(request.Generation, request.Count);
+                        return;
+                    }
+                    RejectNativeSort("Native sort submission failed");
+                }
+                else if (request.Skinning != null)
+                {
+                    ReleaseNativeSort(); // Keep the existing deformed-center CPU semantics.
+                    if (GsplatWebNativeSort.Requested && !m_reportedSkinningFallback)
+                    {
+                        m_reportedSkinningFallback = true;
+                        Debug.LogWarning("[GsplatSorter] CPU-skinned centers use main-thread sorting on Web; the native backend currently handles undeformed centers only.");
+                    }
+                }
 
                 m_activeCpuWorkspace = m_idleCpuWorkspace ?? new CpuSortWorkspace();
                 m_idleCpuWorkspace = null;
@@ -345,6 +368,7 @@ namespace Gsplat
 
             void CompleteCpuWork()
             {
+                CompleteNativeWork();
                 if (m_cpuTask is not { IsCompleted: true })
                     return;
 
@@ -377,12 +401,14 @@ namespace Gsplat
             void CancelCpuWork()
             {
                 m_cpuCancellation?.Cancel();
+                m_nativeSort?.CancelAndWait();
             }
 
             public void Dispose()
             {
                 m_disposed = true;
                 CancelCpuWork();
+                ReleaseNativeSort();
                 m_hasPendingCpuRequest = false;
                 m_cpuCenters = null;
                 m_activeSourceIds = null;
@@ -393,6 +419,90 @@ namespace Gsplat
                 InputKeys = null;
             }
 
+            bool EnsureNativeSort()
+            {
+                if (!GsplatWebNativeSort.Requested || !m_orderTexture)
+                {
+                    ReleaseNativeSort();
+                    return false;
+                }
+                if (m_nativeRejected || m_cpuCenters == null || m_cpuCenters.Length == 0)
+                    return false;
+                if (m_nativeSort != null) return true;
+                m_nativeSort = GsplatWebNativeSort.TryCreate(m_cpuCenters,
+                    checked(m_orderTexture.width * m_orderTexture.height), out var reason);
+                if (m_nativeSort == null)
+                {
+                    if (reason != null) RejectNativeSort(reason);
+                    return false;
+                }
+                // Do not retain duplicate managed radix/output workspaces on the native path.
+                m_idleCpuWorkspace = null;
+                m_orderTextureData = null;
+                return true;
+            }
+
+            void InitializeCpuOrder()
+            {
+                int count = m_activeSourceIds?.Length ?? m_capacity;
+                if (EnsureNativeSort())
+                {
+                    m_nativeSort.Seed(m_activeSourceIds, count);
+                    if (count > 0) m_nativeSort.UploadOrderTexture(m_orderTexture);
+                }
+                else if (m_activeSourceIds != null)
+                {
+                    if (count > 0) UploadOrder(m_activeSourceIds, count);
+                }
+                else
+                {
+                    var workspace = m_idleCpuWorkspace ?? new CpuSortWorkspace();
+                    workspace.EnsureCapacity(m_capacity);
+                    for (var i = 0; i < m_capacity; ++i) workspace.Order[i] = (uint)i;
+                    if (m_capacity > 0) UploadOrder(workspace.Order, m_capacity);
+                    m_idleCpuWorkspace = workspace;
+                }
+                Initialized = true;
+            }
+
+            void CompleteNativeWork()
+            {
+                if (m_nativeSort is not { Running: true }) return;
+                var state = m_nativeSort.Status;
+                if (state is GsplatWebNativeSort.SortStatus.Queued or GsplatWebNativeSort.SortStatus.Running)
+                    return;
+                m_nativeSort.CancelAndWait();
+                if (state == GsplatWebNativeSort.SortStatus.Complete)
+                {
+                    // Never apply an old asset/selection result. A newer camera pose alone
+                    // does not invalidate this complete result while its replacement is sorting.
+                    if (m_nativeResult.Generation == m_cpuGeneration &&
+                        m_nativeResult.Count == (int)LastCpuRequestedCount && !m_disposed)
+                    {
+                        m_nativeSort.UploadOrderTexture(m_orderTexture);
+                        Initialized = true;
+                    }
+                }
+                else
+                {
+                    RejectNativeSort($"Native sort ended with status {state}");
+                    LastCpuRequestedCount = uint.MaxValue;
+                }
+            }
+
+            void ReleaseNativeSort()
+            {
+                m_nativeSort?.Dispose();
+                m_nativeSort = null;
+            }
+
+            void RejectNativeSort(string reason)
+            {
+                ReleaseNativeSort();
+                m_nativeRejected = true;
+                Debug.LogWarning($"[GsplatSorter] {reason}; using main-thread CPU sorting on Web for this resource.");
+            }
+
             void UploadOrder(uint[] source, int count)
             {
                 if (!m_orderTexture)
@@ -401,6 +511,7 @@ namespace Gsplat
                     return;
                 }
 
+                m_orderTextureData ??= new Color32[checked(m_orderTexture.width * m_orderTexture.height)];
                 for (int i = 0; i < count; ++i)
                     m_orderTextureData[i] = GsplatUtils.PackVertexTextureUInt(source[i]);
                 GsplatUtils.UploadVertexDataTexture(m_orderTexture, m_orderTextureData,
@@ -815,7 +926,7 @@ namespace Gsplat
                 string vertexData = GsplatUtils.UseVertexDataTextures
                     ? $" Portable texture draw path is active ({SystemInfo.maxComputeBufferInputsVertex} vertex SSBO slots reported); splat data and draw order use RGBA8 byte-packed sampled textures."
                     : string.Empty;
-                string scheduling = GsplatUtils.SupportsBackgroundCpuSort
+                string scheduling = GsplatWebNativeSort.Requested ? "native-worker (with main-thread fallback)" : GsplatUtils.SupportsBackgroundCpuSort
                     ? "asynchronous"
                     : "main-thread";
                 Debug.LogWarning(

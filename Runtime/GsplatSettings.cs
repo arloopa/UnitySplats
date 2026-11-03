@@ -87,6 +87,12 @@ namespace Gsplat
             "When enabled, 2+ active Gaussian splat renderers are merged into a single globally depth-sorted draw call.")]
         public bool EnableGlobalSort = true;
 
+        [Tooltip("Use native background radix sorting only on Unity 6000+ WebGPU with pthread/shared-memory support. Otherwise use main-thread sorting. Does not enable Unity build threading settings.")]
+        public bool EnableNativeWebSort = false;
+
+        [Tooltip("Maximum native sorting workers requested at first use. Clamped to available precreated Unity workers; changes require a player reload.")]
+        [Range(1, 8)] public int NativeWebSortWorkers = 4;
+
         public uint SplatInstanceSize;
         public uint UploadBatchSize;
         [Range(1, 20)] public uint MaxRenderOrder;
@@ -148,6 +154,8 @@ namespace Gsplat
             GlobalMaterial = DefaultGlobalMaterial;
             Materials = DefaultMaterials;
             EnableGlobalSort = true;
+            EnableNativeWebSort = false;
+            NativeWebSortWorkers = 4;
             SplatInstanceSize = 128;
             UploadBatchSize = 100000;
             MaxRenderOrder = 1;
