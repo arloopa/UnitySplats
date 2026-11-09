@@ -46,6 +46,10 @@ namespace Gsplat
                             m_material[i][j].DisableKeyword(GsplatUtils.k_VertexTextureKeyword);
                             m_material[i][j].EnableKeyword(GsplatUtils.k_VertexBufferKeyword);
                         }
+                        if (GsplatUtils.UseOrderBuffer)
+                            m_material[i][j].EnableKeyword(GsplatUtils.k_OrderBufferKeyword);
+                        else
+                            m_material[i][j].DisableKeyword(GsplatUtils.k_OrderBufferKeyword);
                         m_material[i][j].renderQueue = 3000 + j;
                     }
                 }

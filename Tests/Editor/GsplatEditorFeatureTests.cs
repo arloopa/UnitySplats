@@ -47,6 +47,8 @@ namespace Gsplat.Tests
             try
             {
                 Assert.IsTrue(settings.EnableGlobalSort);
+                Assert.AreEqual(GsplatSettings.DefaultCpuNearExactDistance, settings.CpuNearExactDistance);
+                Assert.AreEqual(40f, settings.CpuNearExactDistance);
             }
             finally
             {

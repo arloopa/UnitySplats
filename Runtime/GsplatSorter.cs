@@ -127,11 +127,13 @@ namespace Gsplat
         {
             public readonly int Generation;
             public readonly int Count;
+            public readonly double SortMs;
 
-            public CpuSortResult(int generation, int count)
+            public CpuSortResult(int generation, int count, double sortMs = 0)
             {
                 Generation = generation;
                 Count = count;
+                SortMs = sortMs;
             }
         }
 
@@ -153,10 +155,41 @@ namespace Gsplat
             Color32[] m_orderTextureData;
             GsplatWebNativeSort m_nativeSort;
             CpuSortResult m_nativeResult;
+            GsplatWebSortDiagnostics m_nativeDiagnostics;
+            double m_pendingCpuSampledAt, m_nativeSampledAt, m_nativePendingMs;
+            double m_legacySortSum, m_legacySortMax;
+            double m_legacyUploadSum, m_legacyUploadMax;
+            double m_legacyLogAt = GsplatWebSortDiagnostics.NowMs;
+            int m_legacySamples;
+            Vector3 m_nativeDepthDirection, m_currentCpuDepthDirection;
             bool m_nativeRejected;
             bool m_reportedNativeStart;
             bool m_reportedSkinningFallback;
             readonly int m_capacity;
+
+            GsplatCpuSpatialSort m_spatialSort;
+            bool m_spatialRejected, m_cpuOrderDeferred;
+            int m_cpuCameraFrame = int.MinValue, m_cpuMultiCameraFrame = int.MinValue;
+            Camera m_cpuFirstCamera;
+
+            public void ObserveCpuCamera(Camera camera, int layer)
+            {
+                if (m_usesGpuSort || m_disposed || !camera || camera.cameraType == CameraType.Preview ||
+                    GsplatRelighting.IsProxyCamera(camera) || (camera.cullingMask & (1 << layer)) == 0) return;
+                int frame = Time.frameCount;
+                if (m_cpuCameraFrame != frame)
+                {
+                    m_cpuCameraFrame = frame;
+                    m_cpuFirstCamera = camera;
+                }
+                else if (m_cpuFirstCamera != camera)
+                    m_cpuMultiCameraFrame = frame;
+            }
+
+            public bool AllowCpuSpatialCulling(Camera camera, int layer) =>
+                camera && (camera.cullingMask & (1 << layer)) != 0 &&
+                m_cpuMultiCameraFrame < Time.frameCount - 1;
+
 
             public GraphicsBuffer OrderBuffer { get; }
             public GraphicsBuffer InputKeys { get; private set; }
@@ -191,6 +224,7 @@ namespace Gsplat
                 if (m_usesGpuSort || m_disposed)
                     return;
 
+                ReleaseSpatialSort();
                 CancelCpuWork();
                 ReleaseNativeSort();
                 m_nativeRejected = false;
@@ -213,6 +247,7 @@ namespace Gsplat
                     throw new ArgumentOutOfRangeException(nameof(sourceIds),
                         "Active source-ID count exceeds the renderer order-buffer capacity.");
 
+                ReleaseSpatialSort();
                 CancelCpuWork();
                 m_cpuGeneration++;
                 m_hasPendingCpuRequest = false;
@@ -231,6 +266,7 @@ namespace Gsplat
                 if (m_disposed)
                     return;
 
+                ReleaseSpatialSort();
                 CancelCpuWork();
                 m_cpuGeneration++;
                 m_hasPendingCpuRequest = false;
@@ -252,6 +288,7 @@ namespace Gsplat
                 if (m_usesGpuSort)
                     return;
 
+                ReleaseSpatialSort();
                 CancelCpuWork();
                 ReleaseNativeSort();
                 CpuAsset = null;
@@ -261,6 +298,123 @@ namespace Gsplat
                 m_hasPendingCpuRequest = false;
                 LastCpuRequestedCount = uint.MaxValue;
                 Initialized = false;
+            }
+
+            public uint CpuDrawCount(uint fallback) => m_spatialSort != null
+                ? (uint)m_spatialSort.VisibleCount : m_cpuOrderDeferred ? 0 : fallback;
+
+            void ReleaseSpatialSort()
+            {
+                m_spatialSort?.Dispose();
+                m_spatialSort = null;
+                m_spatialRejected = false;
+            }
+
+            void DrainCpuWork()
+            {
+                CancelCpuWork();
+                try { m_cpuTask?.GetAwaiter().GetResult(); }
+                catch (OperationCanceledException) { }
+                catch (Exception exception) { Debug.LogException(exception); }
+                m_cpuTask = null;
+                m_cpuCancellation?.Dispose();
+                m_cpuCancellation = null;
+                m_activeCpuWorkspace = null;
+                m_hasPendingCpuRequest = false;
+                LastCpuRequestedCount = uint.MaxValue;
+            }
+
+            public bool TryUpdateCpuSpatial(Camera camera, IGsplat gs)
+            {
+                if (m_usesGpuSort || m_disposed) return false;
+                var settings = GsplatSettings.Instance;
+                var renderer = gs as GsplatRenderer;
+                int count = m_activeSourceIds?.Length ?? m_cpuCenters?.Length ?? 0;
+                bool eligible = settings.EnableCpuSortOptimization && !m_spatialRejected && renderer &&
+                    CpuAsset && count > 0 && count == gs.RemainingCount &&
+                    gs.GsplatResource?.UploadedCount == CpuAsset.SplatCount && !renderer.HasActiveSkinningAnimation;
+                if (m_spatialSort != null && (!eligible ||
+                    m_spatialSort.LeafCapacity != GsplatCpuSpatialSort.DefaultLeafCapacity ||
+                    m_spatialSort.MaxDepth != GsplatCpuSpatialSort.DefaultMaxDepth ||
+                    m_spatialSort.NativeRequested != GsplatWebNativeSort.Requested))
+                {
+                    ReleaseSpatialSort();
+                    m_cpuOrderDeferred = true;
+                }
+                if (!eligible)
+                {
+                    if (m_cpuOrderDeferred) InitializeCpuOrder(true);
+                    return false;
+                }
+                try
+                {
+                    if (m_spatialSort == null)
+                    {
+                        // Hard backend transitions drain workers; ordinary camera motion never does.
+                        DrainCpuWork();
+                        ReleaseNativeSort();
+                        m_idleCpuWorkspace = null;
+                        m_orderTextureData = null;
+                        int capacity = m_orderTexture ? checked(m_orderTexture.width * m_orderTexture.height) : m_capacity;
+                        m_spatialSort = new GsplatCpuSpatialSort(m_cpuCenters, m_activeSourceIds, count,
+                            CpuAsset, capacity, GsplatCpuSpatialSort.DefaultLeafCapacity,
+                            GsplatCpuSpatialSort.DefaultMaxDepth, GsplatCpuSpatialSort.DefaultCullToFrustum);
+                        m_cpuOrderDeferred = false;
+                    }
+                    bool allowCulling = AllowCpuSpatialCulling(camera, gs.transform.gameObject.layer);
+                    var matrix = gs.transform.localToWorldMatrix;
+                    float scaleFactor = 1 - renderer.SplatDownscaleFactor;
+                    bool changed = m_spatialSort.Update(camera, matrix, scaleFactor, settings, allowCulling);
+                    if (changed && m_spatialSort.VisibleCount > 0)
+                    {
+                        double at = GsplatWebSortDiagnostics.NowMs;
+                        int uploadBytes;
+                        if (m_spatialSort.HasNativeOutput)
+                        {
+                            uploadBytes = m_orderTexture
+                                ? m_spatialSort.UploadNativeOrder(m_orderTexture)
+                                : m_spatialSort.UploadNativeOrder(OrderBuffer);
+                        }
+                        else
+                        {
+                            uploadBytes = UploadSpatialOrder(m_spatialSort.Output,
+                                m_spatialSort.VisibleCount);
+                        }
+                        m_spatialSort.RecordUpload(GsplatWebSortDiagnostics.NowMs - at, uploadBytes,
+                            settings.ShowDebugLog);
+                    }
+                    // Consume the completed output before either backend can overwrite it.
+                    m_spatialSort.TryStartNext(camera, matrix, scaleFactor, settings);
+                    Initialized = m_spatialSort.Ready;
+                    m_spatialSort.Report(CpuAsset, settings.ShowDebugLog);
+                    return true;
+                }
+                catch (Exception exception) when (exception is ArgumentException or NotSupportedException or
+                    InvalidOperationException or OverflowException or OutOfMemoryException)
+                {
+                    ReleaseSpatialSort();
+                    m_spatialRejected = true;
+                    Debug.LogWarning($"[GsplatSorter] CPU spatial sorting unavailable for '{CpuAsset?.name}': {exception.Message}; using global CPU view-Z sorting.", CpuAsset);
+                    InitializeCpuOrder(true);
+                    return false;
+                }
+            }
+
+            unsafe int UploadSpatialOrder(uint[] source, int count)
+            {
+                if (source == null || count <= 0) return 0;
+                if (!m_orderTexture)
+                {
+                    OrderBuffer.SetData(source, 0, 0, count);
+                    return count * sizeof(uint);
+                }
+                // RGBA8 order textures encode little-endian uint IDs. LoadRawTextureData
+                // requires the complete texture payload; the game shader uses only the visible
+                // draw count, but stale IDs after that prefix still have to be present.
+                fixed (uint* pointer = source)
+                    m_orderTexture.LoadRawTextureData((IntPtr)pointer, checked(source.Length * sizeof(uint)));
+                m_orderTexture.Apply(false, false);
+                return source.Length * sizeof(uint);
             }
 
             public void QueueCpuSort(Matrix4x4 matrixMv, uint requestedCount, bool force,
@@ -282,7 +436,14 @@ namespace Gsplat
                 // source/selection/camera-identity changes are invalidated separately.
                 m_pendingCpuRequest = new CpuSortRequest(m_cpuCenters, m_activeSourceIds, (int)count,
                     m_cpuGeneration, matrixMv, skinning);
+                m_pendingCpuSampledAt = GsplatSettings.Instance.ShowDebugLog
+                    ? GsplatWebSortDiagnostics.NowMs : 0;
                 m_hasPendingCpuRequest = true;
+            }
+
+            public void UpdateNativeTimingView(Matrix4x4 matrixMv)
+            {
+                m_currentCpuDepthDirection = new Vector3(matrixMv.m20, matrixMv.m21, matrixMv.m22);
             }
 
             public void InvalidateCpuCamera()
@@ -322,13 +483,24 @@ namespace Gsplat
 
                 if (request.Skinning == null && EnsureNativeSort())
                 {
-                    if (m_nativeSort.TryStart(request.SourceIds, request.Count, request.M20, request.M21, request.M22, request.M23))
+                    bool collectTimings = GsplatSettings.Instance.ShowDebugLog;
+                    double submittedAt = collectTimings ? GsplatWebSortDiagnostics.NowMs : 0;
+                    if (m_nativeSort.TryStart(request.SourceIds, request.Count, request.M20, request.M21, request.M22, request.M23, collectTimings))
                     {
                         if (!m_reportedNativeStart)
                         {
                             m_reportedNativeStart = true;
-                            Debug.Log($"[GsplatSorter] Native WebGPU radix sorting active: {request.Count:N0} splats; direct RGBA8 order upload, no managed index repacking.");
+                            if (GsplatSettings.Instance.ShowDebugLog)
+                                Debug.Log($"[GsplatSorter] Native WebGPU radix sorting active: {request.Count:N0} splats; direct order upload, no managed index repacking.");
                         }
+                        if (collectTimings)
+                        {
+                            m_nativeDiagnostics ??= new GsplatWebSortDiagnostics();
+                            m_nativeSampledAt = m_pendingCpuSampledAt > 0 ? m_pendingCpuSampledAt : submittedAt;
+                            m_nativePendingMs = submittedAt - m_nativeSampledAt;
+                            m_nativeDepthDirection = new Vector3(request.M20, request.M21, request.M22);
+                        }
+                        else m_nativeDiagnostics = null;
                         m_nativeResult = new CpuSortResult(request.Generation, request.Count);
                         return;
                     }
@@ -379,8 +551,13 @@ namespace Gsplat
                         result.Count == (int)LastCpuRequestedCount &&
                         (OrderBuffer != null || m_orderTexture != null) && !m_disposed)
                     {
+                        double uploadStarted = GsplatSettings.Instance.ShowDebugLog
+                            ? GsplatWebSortDiagnostics.NowMs : 0;
                         UploadOrder(m_activeCpuWorkspace.Order, result.Count);
                         Initialized = true;
+                        if (uploadStarted > 0 && result.SortMs > 0)
+                            RecordLegacyTiming(result.Count, result.SortMs,
+                                GsplatWebSortDiagnostics.NowMs - uploadStarted);
                     }
                 }
                 else if (m_cpuTask.IsFaulted &&
@@ -398,6 +575,32 @@ namespace Gsplat
                 m_activeCpuWorkspace = null;
             }
 
+            void RecordLegacyTiming(int count, double sortMs, double uploadMs)
+            {
+                sortMs = Math.Max(0, sortMs);
+                uploadMs = Math.Max(0, uploadMs);
+                m_legacySortSum += sortMs;
+                m_legacySortMax = Math.Max(m_legacySortMax, sortMs);
+                m_legacyUploadSum += uploadMs;
+                m_legacyUploadMax = Math.Max(m_legacyUploadMax, uploadMs);
+                ++m_legacySamples;
+                double now = GsplatWebSortDiagnostics.NowMs;
+                double elapsed = now - m_legacyLogAt;
+                if (elapsed < 1000) return;
+                string scheduling = GsplatWebNativeSort.Requested
+                    ? "main-thread fallback"
+                    : GsplatUtils.SupportsBackgroundCpuSort ? "background" : "main-thread";
+                Debug.Log($"[GsplatSorter][CpuSortTiming] asset='{(CpuAsset ? CpuAsset.name : "<none>")}' " +
+                    $"points(last)={count:N0} scheduling={scheduling} windowSec={elapsed / 1000:F2} " +
+                    $"applied={m_legacySamples} appliedHz={m_legacySamples * 1000 / elapsed:F2} " +
+                    $"avg/max sortMs={m_legacySortSum / m_legacySamples:F2}/{m_legacySortMax:F2} " +
+                    $"uploadMs={m_legacyUploadSum / m_legacySamples:F2}/{m_legacyUploadMax:F2}", CpuAsset);
+                m_legacySamples = 0;
+                m_legacySortSum = m_legacySortMax = 0;
+                m_legacyUploadSum = m_legacyUploadMax = 0;
+                m_legacyLogAt = now;
+            }
+
             void CancelCpuWork()
             {
                 m_cpuCancellation?.Cancel();
@@ -407,7 +610,8 @@ namespace Gsplat
             public void Dispose()
             {
                 m_disposed = true;
-                CancelCpuWork();
+                ReleaseSpatialSort();
+                DrainCpuWork();
                 ReleaseNativeSort();
                 m_hasPendingCpuRequest = false;
                 m_cpuCenters = null;
@@ -421,7 +625,9 @@ namespace Gsplat
 
             bool EnsureNativeSort()
             {
-                if (!GsplatWebNativeSort.Requested || !m_orderTexture)
+                // WebGPU's CPU path has no order texture; its StructuredBuffer is still a valid
+                // native upload target.
+                if (!GsplatWebNativeSort.Requested || (!m_orderTexture && OrderBuffer == null))
                 {
                     ReleaseNativeSort();
                     return false;
@@ -429,8 +635,10 @@ namespace Gsplat
                 if (m_nativeRejected || m_cpuCenters == null || m_cpuCenters.Length == 0)
                     return false;
                 if (m_nativeSort != null) return true;
-                m_nativeSort = GsplatWebNativeSort.TryCreate(m_cpuCenters,
-                    checked(m_orderTexture.width * m_orderTexture.height), out var reason);
+                int nativeCapacity = m_orderTexture
+                    ? checked(m_orderTexture.width * m_orderTexture.height)
+                    : m_capacity;
+                m_nativeSort = GsplatWebNativeSort.TryCreate(m_cpuCenters, nativeCapacity, out var reason);
                 if (m_nativeSort == null)
                 {
                     if (reason != null) RejectNativeSort(reason);
@@ -442,13 +650,26 @@ namespace Gsplat
                 return true;
             }
 
-            void InitializeCpuOrder()
+            void InitializeCpuOrder(bool forceLegacy = false)
             {
+                if (!forceLegacy && GsplatSettings.Instance.EnableCpuSortOptimization)
+                {
+                    m_cpuOrderDeferred = true;
+                    Initialized = false;
+                    return;
+                }
+                m_cpuOrderDeferred = false;
                 int count = m_activeSourceIds?.Length ?? m_capacity;
                 if (EnsureNativeSort())
                 {
                     m_nativeSort.Seed(m_activeSourceIds, count);
-                    if (count > 0) m_nativeSort.UploadOrderTexture(m_orderTexture);
+                    if (count > 0)
+                    {
+                        if (m_orderTexture)
+                            m_nativeSort.UploadOrderTexture(m_orderTexture);
+                        else if (OrderBuffer != null)
+                            m_nativeSort.UploadOrderBuffer(OrderBuffer, count);
+                    }
                 }
                 else if (m_activeSourceIds != null)
                 {
@@ -479,7 +700,30 @@ namespace Gsplat
                     if (m_nativeResult.Generation == m_cpuGeneration &&
                         m_nativeResult.Count == (int)LastCpuRequestedCount && !m_disposed)
                     {
-                        m_nativeSort.UploadOrderTexture(m_orderTexture);
+                        GsplatWebNativeSort.NativeTimings nativeTimings = default;
+                        bool collectTimings = m_nativeDiagnostics != null &&
+                            GsplatSettings.Instance.ShowDebugLog &&
+                            m_nativeSort.TryGetTimings(out nativeTimings);
+                        GsplatWebNativeSort.UploadTimings upload = default;
+                        int uploadBytes;
+                        if (m_orderTexture)
+                        {
+                            upload = m_nativeSort.UploadOrderTexture(m_orderTexture, collectTimings);
+                            uploadBytes = m_nativeSort.UploadBytes;
+                        }
+                        else
+                        {
+                            upload = m_nativeSort.UploadOrderBuffer(OrderBuffer, m_nativeResult.Count, collectTimings);
+                            uploadBytes = m_nativeResult.Count * sizeof(uint);
+                        }
+                        if (collectTimings)
+                        {
+                            int resourceId = m_orderTexture ? m_orderTexture.GetInstanceID() : 0;
+                            m_nativeDiagnostics.Record(m_nativePendingMs, nativeTimings, upload,
+                                GsplatWebSortDiagnostics.NowMs - m_nativeSampledAt,
+                                Vector3.Angle(m_nativeDepthDirection, m_currentCpuDepthDirection),
+                                m_nativeResult.Count, uploadBytes, CpuAsset, resourceId);
+                        }
                         Initialized = true;
                     }
                 }
@@ -494,6 +738,7 @@ namespace Gsplat
             {
                 m_nativeSort?.Dispose();
                 m_nativeSort = null;
+                m_nativeDiagnostics = null;
             }
 
             void RejectNativeSort(string reason)
@@ -537,6 +782,8 @@ namespace Gsplat
         GsplatSortPass m_sortPass;
         Camera m_cpuSortCamera;
         Camera m_lastCpuSortCamera;
+        Camera[] m_cpuDrawCameras = Array.Empty<Camera>();
+        int m_cpuDrawCameraCount;
 #if UNITY_EDITOR
         Camera m_editorPreferredCpuSortCamera;
 #endif
@@ -555,6 +802,9 @@ namespace Gsplat
 
         /// <summary>True when sorting is using the portable CPU fallback.</summary>
         public bool CpuFallbackEnabled => !GpuSortEnabled && CpuFallbackSupported;
+
+        internal uint GetCpuDrawCount(ISorterResource resource, uint fallback) =>
+            resource is Resource { UsesGpuSort: false } cpu ? cpu.CpuDrawCount(fallback) : fallback;
 
         public bool Valid => GpuSortEnabled || CpuFallbackEnabled;
 
@@ -594,6 +844,7 @@ namespace Gsplat
             {
                 if (!GraphicsSettings.currentRenderPipeline)
                     Camera.onPreCull += OnPreCullCamera;
+                RenderPipelineManager.beginCameraRendering += ObserveSrpCpuCamera;
             }
 
             m_gsplats.Add(gsplat);
@@ -636,6 +887,9 @@ namespace Gsplat
             m_commandBuffer?.Dispose();
             m_commandBuffer = null;
             Camera.onPreCull -= OnPreCullCamera;
+            RenderPipelineManager.beginCameraRendering -= ObserveSrpCpuCamera;
+            m_cpuDrawCameras = Array.Empty<Camera>();
+            m_cpuDrawCameraCount = 0;
             m_globalRenderer.DisposeGlobalBuffers();
         }
 
@@ -644,15 +898,41 @@ namespace Gsplat
             if (cam.cameraType == CameraType.Preview || GsplatRelighting.IsProxyCamera(cam))
                 return false;
 
-            if (CpuFallbackEnabled)
+            bool cpuFallback = CpuFallbackEnabled;
+            bool observeCameras = cpuFallback && GsplatSettings.Instance.EnableCpuSortOptimization;
+            if (cpuFallback)
                 RememberCpuSortCamera(cam);
 
             m_activeGsplats.Clear();
             foreach (var gs in m_gsplats.Where(gs =>
                          gs is { isActiveAndEnabled: true, Valid: true } && gs.RemainingCount != 0))
+            {
                 m_activeGsplats.Add(gs);
+                if (observeCameras && gs.SorterResource is Resource res)
+                    res.ObserveCpuCamera(cam, gs.transform.gameObject.layer);
+            }
 
             return m_activeGsplats.Count != 0;
+        }
+
+        void ObserveSrpCpuCamera(ScriptableRenderContext context, Camera camera)
+        {
+            // RenderMeshPrimitives has no camera binding. Observe SRP cameras even when their
+            // renderer lacks our sorting feature; they can still consume this shared order.
+            if (!CpuFallbackEnabled || !GsplatSettings.Instance.EnableCpuSortOptimization) return;
+            foreach (var gs in m_gsplats)
+                if (gs is { isActiveAndEnabled: true, Valid: true } && gs.RemainingCount != 0 &&
+                    gs.SorterResource is Resource res)
+                    res.ObserveCpuCamera(camera, gs.transform.gameObject.layer);
+        }
+
+        void RefreshCpuDrawCameras()
+        {
+            // Reuse the snapshot array; do not allocate Camera.allCameras every frame.
+            int count = Camera.allCamerasCount;
+            if (m_cpuDrawCameras.Length < count)
+                m_cpuDrawCameras = new Camera[Mathf.NextPowerOfTwo(count)];
+            m_cpuDrawCameraCount = Camera.GetAllCameras(m_cpuDrawCameras);
         }
 
         // Decides scene-wide whether the global merge can run this frame.
@@ -923,9 +1203,11 @@ namespace Gsplat
             if (!m_warnedCpuFallback && m_gsplats.Count != 0)
             {
                 m_warnedCpuFallback = true;
-                string vertexData = GsplatUtils.UseVertexDataTextures
-                    ? $" Portable texture draw path is active ({SystemInfo.maxComputeBufferInputsVertex} vertex SSBO slots reported); splat data and draw order use RGBA8 byte-packed sampled textures."
-                    : string.Empty;
+                string vertexData = GsplatUtils.UseOrderBuffer
+                    ? " Splat data use the portable sampled-texture path; draw order uses a StructuredBuffer."
+                    : GsplatUtils.UseVertexDataTextures
+                        ? $" Portable texture draw path is active ({SystemInfo.maxComputeBufferInputsVertex} vertex SSBO slots reported); splat data and draw order use RGBA8 byte-packed sampled textures."
+                        : string.Empty;
                 string scheduling = GsplatWebNativeSort.Requested ? "native-worker (with main-thread fallback)" : GsplatUtils.SupportsBackgroundCpuSort
                     ? "asynchronous"
                     : "main-thread";
@@ -943,6 +1225,8 @@ namespace Gsplat
                 m_activeGsplats.Add(gs);
             }
 
+            bool spatialEnabled = GsplatSettings.Instance.EnableCpuSortOptimization;
+            if (spatialEnabled) RefreshCpuDrawCameras();
             var camera = ResolveCpuSortCamera();
             if (!camera)
             {
@@ -960,8 +1244,19 @@ namespace Gsplat
                 if (gs.SorterResource is not Resource { UsesGpuSort: false } res)
                     continue;
 
+                if (spatialEnabled)
+                {
+                    int layer = gs.transform.gameObject.layer;
+                    res.ObserveCpuCamera(camera, layer);
+                    for (int i = 0; i < m_cpuDrawCameraCount; ++i)
+                        res.ObserveCpuCamera(m_cpuDrawCameras[i], layer);
+                }
+                if (res.TryUpdateCpuSpatial(camera, gs))
+                    continue;
                 if (cameraChanged)
                     res.InvalidateCpuCamera();
+                if (GsplatSettings.Instance.ShowDebugLog)
+                    res.UpdateNativeTimingView(matrixV * gs.transform.localToWorldMatrix);
                 res.UpdateCpuWork();
                 var countChanged = gs.RemainingCount != res.LastCpuRequestedCount;
                 var forceSort = gs.ComputeSortRequired || !res.Initialized || cameraChanged;
@@ -1179,6 +1474,7 @@ namespace Gsplat
         static CpuSortResult SortCpu(CpuSortRequest request, CpuSortWorkspace workspace,
             CancellationToken cancellationToken)
         {
+            double startedAt = GsplatWebSortDiagnostics.NowMs;
             for (var i = 0; i < request.Count; ++i)
             {
                 if ((i & k_cpuCancellationCheckMask) == 0)
@@ -1232,7 +1528,8 @@ namespace Gsplat
             if (!ReferenceEquals(source, workspace.Order))
                 Array.Copy(source, workspace.Order, request.Count);
 
-            return new CpuSortResult(request.Generation, request.Count);
+            return new CpuSortResult(request.Generation, request.Count,
+                GsplatWebSortDiagnostics.NowMs - startedAt);
         }
 
         static int DepthDigit(CpuSortRequest request, uint sourceId, int shift)

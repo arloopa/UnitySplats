@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: MIT
 using System.Reflection;
+using System.Runtime.InteropServices;
 using NUnit.Framework;
 
 namespace Gsplat.Tests
 {
     public class GsplatWebNativeSortPolicyTests
     {
+        [Test]
+        public void NativeTimingLayoutMatchesFourDoubles()
+        {
+            Assert.AreEqual(32, Marshal.SizeOf<GsplatWebNativeSort.NativeTimings>());
+        }
+
         [Test]
         public void EditorNeverInvokesTheWebNativeBackend()
         {
