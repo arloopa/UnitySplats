@@ -1,0 +1,27 @@
+fileFormatVersion: 2
+guid: de9ce76eda40c61a4fc7a947e88a85b9
+PluginImporter:
+  externalObjects: {}
+  serializedVersion: 3
+  iconMap: {}
+  executionOrder: {}
+  defineConstraints: []
+  isPreloaded: 0
+  isOverridable: 0
+  isExplicitlyReferenced: 0
+  validateReferences: 1
+  platformData:
+    Any:
+      enabled: 0
+      settings: {}
+    Editor:
+      enabled: 0
+      settings:
+        DefaultValueInitialized: true
+    WebGL:
+      enabled: 1
+      settings:
+        emscriptenArgs: -std=c11 -ffp-contract=off
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

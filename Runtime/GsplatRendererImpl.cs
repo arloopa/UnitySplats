@@ -347,19 +347,19 @@ namespace Gsplat
                 // GsplatRendererImpl can otherwise be created before GsplatSettings.OnEnable runs.
                 _ = GsplatSettings.Instance;
                 bool useVertexDataTextures = GsplatUtils.UseVertexDataTextures;
-                if (useVertexDataTextures)
+                if (GsplatUtils.UseOrderBuffer || !useVertexDataTextures)
                 {
-                    OrderTexture = GsplatUtils.CreateVertexDataTexture((int)splatCount,
-                        GraphicsFormat.R8G8B8A8_UNorm, "Gsplat.Order.Texture");
-                }
-                else
-                {
-                    // The CPU path only needs a shader-readable structured buffer. Avoid requiring
-                    // append/UAV behavior when the compute-only cutout path is disabled.
+                    // WebGPU keeps splat data in textures but stores draw order in a
+                    // StructuredBuffer; the desktop CPU path also uses a buffer.
                     var orderTarget = GsplatSorter.Instance.CpuFallbackEnabled
                         ? GraphicsBuffer.Target.Structured
                         : GraphicsBuffer.Target.Append;
                     OrderBuffer = new GraphicsBuffer(orderTarget, (int)splatCount, sizeof(uint));
+                }
+                else
+                {
+                    OrderTexture = GsplatUtils.CreateVertexDataTexture((int)splatCount,
+                        GraphicsFormat.R8G8B8A8_UNorm, "Gsplat.Order.Texture");
                 }
 
                 SorterResource = GsplatSorter.Instance.CreateSorterResource(splatCount, OrderBuffer, OrderTexture);
@@ -543,10 +543,11 @@ namespace Gsplat
             float relightingBrightness = 2f, float relightingBackground = 1f,
             GsplatSkinningSource rig = null, GsplatVolumeLighting volumeLighting = null)
         {
-            if (m_remainingCount <= 0)
+            uint drawCount = GsplatSorter.Instance.GetCpuDrawCount(SorterResource, m_remainingCount);
+            if (drawCount == 0)
                 return;
 
-            m_propertyBlock.SetInteger(k_splatCount, (int)m_remainingCount);
+            m_propertyBlock.SetInteger(k_splatCount, (int)drawCount);
             m_propertyBlock.SetInteger(k_gammaToLinear, gammaToLinear ? 1 : 0);
             m_propertyBlock.SetInteger(k_splatInstanceSize, (int)GsplatSettings.Instance.SplatInstanceSize);
             m_propertyBlock.SetInteger(k_shDegree, Math.Min(m_gsplatAsset.SHBands, shDegree));
@@ -677,7 +678,7 @@ namespace Gsplat
             };
 
             Graphics.RenderMeshPrimitives(rp, GsplatSettings.Instance.Mesh, 0,
-                Mathf.CeilToInt(m_remainingCount / (float)GsplatSettings.Instance.SplatInstanceSize));
+                Mathf.CeilToInt(drawCount / (float)GsplatSettings.Instance.SplatInstanceSize));
         }
     }
 }
