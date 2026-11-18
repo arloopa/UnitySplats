@@ -4,6 +4,8 @@
 [![Unity](https://img.shields.io/badge/Unity-6000.0%2B-black.svg)](https://unity.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE.md)
 
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
+
 UnitySplats is a cross-platform Unity 6 package for importing, loading, and rendering [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) (3DGS) content. It supports the Built-in Render Pipeline, URP, and HDRP, with GPU and portable CPU sorting paths selected at runtime.
 
 ![Gaussian splat rendered in Unity](Documentation~/Images/splat.png)
