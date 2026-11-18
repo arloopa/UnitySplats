@@ -1,6 +1,6 @@
 # UnitySplats
 
-[![Version](https://img.shields.io/badge/version-v2.0.0-blue.svg)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v2.1.0-blue.svg)](./CHANGELOG.md)
 [![Unity](https://img.shields.io/badge/Unity-6000.0%2B-black.svg)](https://unity.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE.md)
 
@@ -84,7 +84,7 @@ Desktop CPU paths use a managed background task. Web requires **Enable Native We
 
 The previous completed order stays drawable while the next job runs. Completed results are collected and uploaded before replacement work starts in the same CPU tick, so the output storage is not overwritten before upload. Unchanged inputs do not resubmit. Refresh depends on sorting time and the CPU tick, without an extra collect-only frame or upload budget. The managed hybrid sorter keeps input-ordinal depth keys and two reusable ID buffers; no separate CPU publication copy is needed. Small exact ranges use stable insertion sort, and equal-key ranges retain input order without radix passes. Both managed and native hybrid sorting preserve equal-key input order and reuse bucket counts as scatter offsets in place. Culling margins, leaf size and bucket width are internal implementation choices.
 
-On WebGPU, CPU draw order uses a **StructuredBuffer**, while splat data remains in sampled textures. Only the visible order prefix is uploaded, directly from native output when available. This storage choice is automatic, including when both feature switches are off. WebGL keeps the RGBA8 order texture and uploads its full payload.
+On WebGPU, CPU draw order uses a **StructuredBuffer**, while splat data remains in sampled textures. Only the visible order prefix is uploaded, directly from native output when available. This storage choice is automatic, including when both feature switches are off. WebGPU devices that report no vertex-stage storage buffers (for example in WebGPU compatibility mode) keep the RGBA8 order texture instead, and so does WebGL, which uploads its full payload. Builds for other graphics APIs strip the WebGPU-only `GSPLAT_ORDER_BUFFER` shader variants, so their shader variant count is unchanged.
 
 Each renderer still has one preferred-camera order. Enabled cameras are checked before CPU drawing; camera gathers and SRP callbacks also observe cameras that may consume the shared order, including cameras without the sorting Feature. This is conservative: a camera need not ultimately draw the renderer to be counted. Layer-incompatible, Preview and relighting-proxy cameras are excluded. Multiple compatible cameras observed in the current or previous frame disable frustum culling. On that transition, an old culled job is drained and all original source IDs are uploaded before asynchronous sorting resumes. A newly observed manual camera takes effect at the next CPU tick. Culling can resume with one observed compatible viewpoint; separate per-camera orders are not created.
 

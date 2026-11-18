@@ -12,7 +12,7 @@ namespace Gsplat
     public static class GsplatUtils
     {
         public const string k_PackagePath = "Packages/com.arloopa.unitysplats/";
-        public static readonly Version k_Version = new("2.0.0");
+        public static readonly Version k_Version = new("2.1.0");
         internal static readonly Version k_SettingsVersion = new("1.5.0");
         public const string k_VertexTextureKeyword = "GSPLAT_VERTEX_TEXTURES";
         public const string k_VertexBufferKeyword = "GSPLAT_VERTEX_BUFFERS";
@@ -60,7 +60,14 @@ namespace Gsplat
         /// textures. WebGPU uses this mixed path so the CPU sorter can upload only visible IDs.
         /// </summary>
         public static bool UseOrderBuffer =>
-            SystemInfo.graphicsDeviceType == GraphicsDeviceType.WebGPU;
+            UsesOrderBuffer(SystemInfo.graphicsDeviceType, SystemInfo.maxComputeBufferInputsVertex);
+
+        /// <summary>
+        /// WebGPU devices can expose no vertex-stage storage buffers (for example in WebGPU
+        /// compatibility mode). Those keep the RGBA8 order texture so splats still render.
+        /// </summary>
+        internal static bool UsesOrderBuffer(GraphicsDeviceType type, int vertexBufferInputs) =>
+            type == GraphicsDeviceType.WebGPU && vertexBufferInputs > 0;
 
         public static Texture2D CreateVertexDataTexture(int pixelCount, GraphicsFormat format, string name)
         {

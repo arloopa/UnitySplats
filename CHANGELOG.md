@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-18
+
 ### Added
 
-- Opt-in native pthread CPU sorting for Unity 6000+ WebGPU. An internal request cap is limited by Unity's available precreated workers; it is not a public worker-count setting and does not increase Unity's allocation. The existing main-thread sorter remains the fallback when native sorting is unavailable.
+- Opt-in native pthread CPU sorting for Unity 6000+ WebGPU. An internal request cap is limited by Unity's available precreated workers; it is not a public worker-count setting and does not increase Unity's allocation. The existing main-thread sorter remains the fallback when native sorting is unavailable. ([#3](https://github.com/arloopa/UnitySplats/pull/3), thanks @RuyeRuye)
 - Opt-in CPU sort optimization for fully uploaded static uncompressed/Spark sources: octree visibility selection followed by one global near-exact/far-bucket view-depth sort. The previous completed order remains drawable while the next job runs. When multiple compatible cameras share a renderer, frustum culling is disabled and the complete source-ID set is used.
 - `Near Exact Distance` (default 40 world units) controls the exact/far split. Nearby selected points use full 32-bit depth keys; far points use the high 18 bits of the sortable depth key. Setting the distance to `0` sorts all selected points exactly without disabling culling.
 - Opt-in `Show Debug Log` timing summaries for CPU sorting and uploads, including selected-point count, exact near-point count, job age and view-depth-axis change.
@@ -17,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - WebGPU CPU draw order now uses a StructuredBuffer and can upload only the visible prefix, directly from native output when native sorting is active. Splat data remains in sampled textures. This storage choice applies even with the new features disabled; WebGL retains its RGBA8 order texture.
+
+### Fixed
+
+- WebGPU devices that report no vertex-stage storage buffers (for example in WebGPU compatibility mode) keep the RGBA8 order texture instead of the new order StructuredBuffer, so splats still render there.
+- Player builds for graphics APIs other than WebGPU now strip the WebGPU-only `GSPLAT_ORDER_BUFFER` shader variants, restoring the previous `Gsplat/Standard` variant count and shader build time on those platforms.
+- The Editor test assembly references `Unity.Mathematics` and the Unity Test Framework explicitly, so the package tests compile again.
 
 ## [2.0.0] - 2026-10-21
 
@@ -102,7 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed URP compilation on Unity 6000.4 and newer, where the legacy `ScriptableRenderPass.Execute` override was removed in favor of RenderGraph.
 - Fixed Project-to-Hierarchy drag-and-drop on Unity 6000.4 and newer by using the 64-bit `EntityId` handler instead of the obsolete 32-bit `InstanceID` delegate.
 
-[unreleased]: https://github.com/arloopa/UnitySplats/compare/v2.0.0...HEAD
+[unreleased]: https://github.com/arloopa/UnitySplats/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/arloopa/UnitySplats/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/arloopa/UnitySplats/compare/v1.2.0...v2.0.0
 [1.2.0]: https://github.com/arloopa/UnitySplats/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/arloopa/UnitySplats/compare/v1.0.1...v1.1.0
