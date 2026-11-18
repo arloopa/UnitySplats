@@ -26,7 +26,7 @@ UnitySplats is a Unity implementation maintained by ARLOOPA. It is not an offici
 - Spark-packed and uncompressed Unity asset representations.
 - Asynchronous GPU upload with optional rendering during upload.
 - Orthographic cameras, MSAA, cutouts, active source ranges, and XR integration.
-- Runtime graphics-backend selection for Direct3D, Vulkan, Metal, OpenGL, and WebGL 2.
+- Runtime graphics-backend selection for Direct3D, Vulkan, Metal, OpenGL, WebGL 2, and WebGPU.
 
 ## Supported formats
 
@@ -53,12 +53,44 @@ UnitySplats chooses the fastest compatible sorting and rendering path at runtime
 | Android | OpenGL ES 3.1 | Asynchronous CPU sort and portable sampled-texture draw path |
 | macOS, iOS | Metal | GPU radix sort when supported; CPU fallback otherwise |
 | Web | WebGL 2 | Main-thread CPU sort and portable sampled-texture draw path |
+| Web | WebGPU | Optional native-worker CPU sort and CPU sort optimization; main-thread fallback; splat textures with an order buffer |
 
 The OpenGL ES path uses RGBA8 byte-packed and floating-point sampled textures instead of vertex-stage storage buffers. This avoids driver failures seen when some mobile GPUs report SSBO support but reject Unity's generated `BufferBlock` bindings. OpenGL ES 3.1 is the minimum supported Android OpenGL version.
 
 Maintainer testing has covered multiple Android and Apple devices using OpenGL ES, Vulkan, and Metal, including Samsung and HONOR Android hardware and Meta Quest 3 and Meta Quest 3S headsets. Samsung and HONOR devices were also used to validate the GLES compatibility path. Device drivers still vary, so a listed API is a supported target rather than a guarantee for every GPU/OS combination. Hardware reports are welcome through GitHub Issues.
 
 The WebGL 2 path does not create compute or structured graphics buffers. It stores splat data and draw order in sampled textures and runs the counting sort on Unity's main thread. Use Spark compression and moderate splat counts for Web builds: browser memory limits and synchronous sorting make large uncompressed assets substantially more expensive than on native platforms. Global merge and compute cutouts are unavailable on WebGL.
+
+### WebGPU and native CPU sorting
+
+On Unity 6000+, enable WebGPU and native C/C++ multithreading in Player Settings, then enable **Native Web Sorting > Enable Native Web Sort** in `Project Settings > Gsplat` (off by default). The sorter is capped by the precreated workers actually supplied by Unity. Enable **Show Debug Log** before native-pool initialization to log the actual worker count; enabling it after initialization does not replay that one-time message. The internal request cap does not imply that many workers are available and does not increase Unity's worker allocation. Confirm `Native WebGPU radix sorting active` in the player log. This uses CPU workers, not subgroup-dependent GPU sorting; CPU-skinned models retain the main-thread fallback.
+
+Serve the player page over HTTPS (localhost is fine for development), and set the following HTTP response headers on the player page and worker script responses. COEP is a choice between two options; `credentialless` is shown below. If you choose `require-corp`, simply replace the corresponding line.
+
+```http
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: credentialless
+```
+
+The page must be cross-origin isolated (`crossOriginIsolated === true`); cross-origin resources must also satisfy COEP through appropriate CORS or CORP responses. Missing native capabilities select main-thread sorting after the player starts. A threaded player that cannot start without shared memory needs a separate non-threaded build/loader fallback. Workers persist until the page closes. Their allocation is determined by the player build/runtime, not a public Gsplat worker-count setting; rebuild/reload as appropriate when that allocation changes.
+
+### CPU sort optimization
+
+Enable **CPU Sort Optimization > Enable Cpu Sort Optimization** in `Project Settings > Gsplat` (off by default). This applies only to CPU sorting; it does not change the GPU radix path or allocate an octree when GPU sorting is active. Fully uploaded static uncompressed/Spark assets and active source selections are supported. CPU-skinned models and unsupported sources keep the existing sorter.
+
+The octree selects visible source IDs, which then enter one global camera-space **view-depth** sort. It is not a collection of independently sorted spatial blocks. Selected points within **Near Exact Distance** (default 40 world units) use full 32-bit depth keys; far points use the high 18 bits of the sortable float key. This is an absolute camera-space depth distance, not a fraction of the model's depth span or point count. The boundary bucket joins the exact range to preserve the far-to-near order between the two ranges. Set the distance to **0** to sort all selected points exactly; this does not disable culling or asynchronous execution.
+
+Desktop CPU paths use a managed background task. Web requires **Enable Native Web Sort** and the worker setup described above. If native workers are unavailable, the Web optimization is skipped before building the octree and the existing main-thread CPU sorter is used. Threadless WebGL therefore does not receive these optimizations. Disable **Enable Cpu Sort Optimization** to use the existing full-precision CPU sorter; **Enable Native Web Sort** independently controls whether supported WebGPU sorting runs on native workers.
+
+The previous completed order stays drawable while the next job runs. Completed results are collected and uploaded before replacement work starts in the same CPU tick, so the output storage is not overwritten before upload. Unchanged inputs do not resubmit. Refresh depends on sorting time and the CPU tick, without an extra collect-only frame or upload budget. The managed hybrid sorter keeps input-ordinal depth keys and two reusable ID buffers; no separate CPU publication copy is needed. Small exact ranges use stable insertion sort, and equal-key ranges retain input order without radix passes. Both managed and native hybrid sorting preserve equal-key input order and reuse bucket counts as scatter offsets in place. Culling margins, leaf size and bucket width are internal implementation choices.
+
+On WebGPU, CPU draw order uses a **StructuredBuffer**, while splat data remains in sampled textures. Only the visible order prefix is uploaded, directly from native output when available. This storage choice is automatic, including when both feature switches are off. WebGL keeps the RGBA8 order texture and uploads its full payload.
+
+Each renderer still has one preferred-camera order. Enabled cameras are checked before CPU drawing; camera gathers and SRP callbacks also observe cameras that may consume the shared order, including cameras without the sorting Feature. This is conservative: a camera need not ultimately draw the renderer to be counted. Layer-incompatible, Preview and relighting-proxy cameras are excluded. Multiple compatible cameras observed in the current or previous frame disable frustum culling. On that transition, an old culled job is drained and all original source IDs are uploaded before asynchronous sorting resumes. A newly observed manual camera takes effect at the next CPU tick. Culling can resume with one observed compatible viewpoint; separate per-camera orders are not created.
+
+The tree, selection buffer and sorting scratch add CPU memory proportional to splat count. Tree construction is synchronous and can add an initial preparation delay; failed construction releases native sessions and pinned inputs. Single-camera visibility is asynchronous, so a fast turn or teleport can temporarily leave newly visible points outside the last completed selection.
+
+**Show Debug Log** reports timings for native Web sorting, the existing full CPU sorter and the optimized path. Summaries include selected-point and exact near-point counts, job age, view-depth-axis change and upload-call time. The angle includes model transforms as well as camera motion. Upload timings measure the CPU call, not GPU completion. Logging is optional and does not affect job scheduling.
 
 ### Sorting limitations
 

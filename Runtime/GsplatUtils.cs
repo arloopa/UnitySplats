@@ -16,6 +16,7 @@ namespace Gsplat
         internal static readonly Version k_SettingsVersion = new("1.5.0");
         public const string k_VertexTextureKeyword = "GSPLAT_VERTEX_TEXTURES";
         public const string k_VertexBufferKeyword = "GSPLAT_VERTEX_BUFFERS";
+        public const string k_OrderBufferKeyword = "GSPLAT_ORDER_BUFFER";
 
         /// <summary>
         /// Unity Web players run managed code on one thread, so the portable sorter must execute
@@ -53,6 +54,13 @@ namespace Gsplat
 #endif
             }
         }
+
+        /// <summary>
+        /// Whether draw order uses a StructuredBuffer while splat data remains in sampled
+        /// textures. WebGPU uses this mixed path so the CPU sorter can upload only visible IDs.
+        /// </summary>
+        public static bool UseOrderBuffer =>
+            SystemInfo.graphicsDeviceType == GraphicsDeviceType.WebGPU;
 
         public static Texture2D CreateVertexDataTexture(int pixelCount, GraphicsFormat format, string name)
         {

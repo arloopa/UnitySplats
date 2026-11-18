@@ -24,10 +24,13 @@ Shader "Gsplat/Standard"
             // The structured-buffer variant needs shader model 4.5. The texture variant targets
             // shader model 3.5 so it remains available to GLES3 and Unity WebGL 2 players.
             #pragma target 4.5 GSPLAT_VERTEX_BUFFERS
+            #pragma target 4.5 GSPLAT_ORDER_BUFFER
             #pragma target 3.5 GSPLAT_VERTEX_TEXTURES
             #pragma multi_compile SH_BANDS_0 SH_BANDS_1 SH_BANDS_2 SH_BANDS_3 SH_BANDS_4
             #pragma multi_compile UNCOMPRESSED SPARK
             #pragma multi_compile GSPLAT_VERTEX_BUFFERS GSPLAT_VERTEX_TEXTURES
+            // WebGPU CPU fallback: splat data stays in textures; draw order uses a buffer.
+            #pragma multi_compile __ GSPLAT_ORDER_BUFFER
 
             #ifdef GSPLAT_VERTEX_TEXTURES
             int _GsplatTextureWidth;
@@ -62,7 +65,14 @@ Shader "Gsplat/Standard"
             float4 _GsplatRelightParams;
 
             #include "GsplatVolumeLighting.hlsl"
-            #ifdef GSPLAT_VERTEX_TEXTURES
+            #if defined(GSPLAT_ORDER_BUFFER)
+            StructuredBuffer<uint> _OrderBuffer;
+
+            uint LoadSplatOrder(uint index)
+            {
+                return _OrderBuffer[index];
+            }
+            #elif defined(GSPLAT_VERTEX_TEXTURES)
             Texture2D<float4> _OrderTexture;
 
             uint LoadSplatOrder(uint index)

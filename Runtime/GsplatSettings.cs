@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2025 Yize Wu
+// Copyright (c) 2025 Yize Wu
 // SPDX-License-Identifier: MIT
 
 using System;
@@ -87,6 +87,25 @@ namespace Gsplat
             "When enabled, 2+ active Gaussian splat renderers are merged into a single globally depth-sorted draw call.")]
         public bool EnableGlobalSort = true;
 
+        [Tooltip("Use native background radix sorting only on Unity 6000+ WebGPU with pthread/shared-memory support. Otherwise use main-thread sorting. Does not enable Unity build threading settings.")]
+        public bool EnableNativeWebSort = false;
+
+        [Tooltip("CPU fallback only: reduce CPU view-Z sorting work with spatial culling and a near-exact/far-bucket order. " +
+                 "Adds CPU memory for the culling tree, selection/order buffers and sort scratch; memory grows with splat count. " +
+                 "GPU sorting is unchanged.")]
+        public bool EnableCpuSortOptimization = false;
+
+        internal const float DefaultCpuNearExactDistance = 40f;
+
+        [Tooltip("CPU fallback only: camera-space distance (world units) within which points use exact 32-bit " +
+                 "view-depth sorting. Farther points keep the faster 18-bit bucket order. Like an LOD or shadow " +
+                 "distance, this is independent of model depth span and point count. 0 sorts all selected points exactly.")]
+        [Min(0f)]
+        public float CpuNearExactDistance = DefaultCpuNearExactDistance;
+        // The near distance is the one intentional tuning value: it is scene-unit dependent
+        // and directly controls the visual-quality/performance trade-off, like an LOD or
+        // shadow distance. Leaf size and bucket width remain fixed implementation policy.
+
         public uint SplatInstanceSize;
         public uint UploadBatchSize;
         [Range(1, 20)] public uint MaxRenderOrder;
@@ -103,6 +122,8 @@ namespace Gsplat
         public float CameraRotationRefreshTreshold;
 
         public bool ShowImportErrors;
+        [Tooltip("Show CPU/Web sorting timing summaries in the player log. Warnings and errors are always logged.")]
+        public bool ShowDebugLog = false;
         public GsplatMaterial[] Materials;
         public Mesh Mesh { get; private set; }
 
@@ -148,6 +169,10 @@ namespace Gsplat
             GlobalMaterial = DefaultGlobalMaterial;
             Materials = DefaultMaterials;
             EnableGlobalSort = true;
+            EnableNativeWebSort = false;
+            ShowDebugLog = false;
+            EnableCpuSortOptimization = false;
+            CpuNearExactDistance = DefaultCpuNearExactDistance;
             SplatInstanceSize = 128;
             UploadBatchSize = 100000;
             MaxRenderOrder = 1;

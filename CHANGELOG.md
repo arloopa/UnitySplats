@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in native pthread CPU sorting for Unity 6000+ WebGPU. An internal request cap is limited by Unity's available precreated workers; it is not a public worker-count setting and does not increase Unity's allocation. The existing main-thread sorter remains the fallback when native sorting is unavailable.
+- Opt-in CPU sort optimization for fully uploaded static uncompressed/Spark sources: octree visibility selection followed by one global near-exact/far-bucket view-depth sort. The previous completed order remains drawable while the next job runs. When multiple compatible cameras share a renderer, frustum culling is disabled and the complete source-ID set is used.
+- `Near Exact Distance` (default 40 world units) controls the exact/far split. Nearby selected points use full 32-bit depth keys; far points use the high 18 bits of the sortable depth key. Setting the distance to `0` sorts all selected points exactly without disabling culling.
+- Opt-in `Show Debug Log` timing summaries for CPU sorting and uploads, including selected-point count, exact near-point count, job age and view-depth-axis change.
+
+### Changed
+
+- WebGPU CPU draw order now uses a StructuredBuffer and can upload only the visible prefix, directly from native output when native sorting is active. Splat data remains in sampled textures. This storage choice applies even with the new features disabled; WebGL retains its RGBA8 order texture.
+
 ## [2.0.0] - 2026-10-21
 
 ### Added
