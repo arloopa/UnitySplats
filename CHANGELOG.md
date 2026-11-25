@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-11-25
+
+### Fixed
+
+- The CPU fallback sorter (WebGPU, WebGL, Direct3D 11, OpenGL) no longer re-sorts every frame while the camera, renderer transform, splat count and selection are unchanged. With the default **Sort Mode** `Always`, Web players previously spent a full main-thread sort on every frame even with a static camera.
+- The CPU fallback sort evaluates each splat's view depth once and moves keys with their IDs, instead of recomputing depths from randomly ordered centers in all four radix passes. The sorted order is unchanged and the sort is about 4× faster in a 1M-splat benchmark. It uses 7 more bytes of temporary CPU memory per splat.
+
 ## [2.1.0] - 2026-11-18
 
 ### Added
@@ -110,7 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed URP compilation on Unity 6000.4 and newer, where the legacy `ScriptableRenderPass.Execute` override was removed in favor of RenderGraph.
 - Fixed Project-to-Hierarchy drag-and-drop on Unity 6000.4 and newer by using the 64-bit `EntityId` handler instead of the obsolete 32-bit `InstanceID` delegate.
 
-[unreleased]: https://github.com/arloopa/UnitySplats/compare/v2.1.0...HEAD
+[unreleased]: https://github.com/arloopa/UnitySplats/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/arloopa/UnitySplats/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/arloopa/UnitySplats/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/arloopa/UnitySplats/compare/v1.2.0...v2.0.0
 [1.2.0]: https://github.com/arloopa/UnitySplats/compare/v1.1.0...v1.2.0

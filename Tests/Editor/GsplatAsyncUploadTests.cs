@@ -361,6 +361,54 @@ namespace Gsplat.Tests
         }
 
         [Test]
+        public void CpuFallbackDoesNotResortAnUnchangedView()
+        {
+            var settings = GsplatSettings.Instance;
+            bool previousOptimization = settings.EnableCpuSortOptimization;
+            var asset = ScriptableObject.CreateInstance<GsplatAssetUncompressed>();
+            var texture = new Texture2D(2, 1, TextureFormat.RGBA32, false, true);
+            ISorterResource resource = null;
+            try
+            {
+                settings.EnableCpuSortOptimization = false;
+                asset.SplatCount = 2;
+                asset.Positions = new[] { Vector3.zero, Vector3.one };
+                var type = typeof(GsplatSorter).GetNestedType("Resource", BindingFlags.NonPublic);
+                resource = (ISorterResource)Activator.CreateInstance(type,
+                    new object[] { 2u, null, false, texture });
+                type.GetMethod("BindCpuCenters").Invoke(resource, new object[] { asset, asset.Positions });
+                var queue = type.GetMethod("QueueCpuSort");
+                var pending = type.GetField("m_hasPendingCpuRequest",
+                    BindingFlags.Instance | BindingFlags.NonPublic);
+                var view = Matrix4x4.Translate(new Vector3(0, 0, -5));
+                var movedView = Matrix4x4.Translate(new Vector3(0, 0, -6));
+
+                // Sort Mode "Always" requests a sort every frame; only the first one for a view
+                // should be queued.
+                queue.Invoke(resource, new object[] { view, 2u, false, true, null });
+                Assert.IsTrue((bool)pending.GetValue(resource));
+                pending.SetValue(resource, false);
+
+                queue.Invoke(resource, new object[] { view, 2u, false, true, null });
+                Assert.IsFalse((bool)pending.GetValue(resource), "An unchanged view must not resort.");
+
+                queue.Invoke(resource, new object[] { movedView, 2u, false, true, null });
+                Assert.IsTrue((bool)pending.GetValue(resource), "A moved camera must resort.");
+                pending.SetValue(resource, false);
+
+                queue.Invoke(resource, new object[] { movedView, 2u, true, true, null });
+                Assert.IsTrue((bool)pending.GetValue(resource), "A forced sort must always queue.");
+            }
+            finally
+            {
+                resource?.Dispose();
+                settings.EnableCpuSortOptimization = previousOptimization;
+                UnityEngine.Object.DestroyImmediate(texture);
+                UnityEngine.Object.DestroyImmediate(asset);
+            }
+        }
+
+        [Test]
         public void BuiltInNoDrawablePathClearsCommandsFromPreviousFrame()
         {
             GsplatSorter sorter = GsplatSorter.Instance;

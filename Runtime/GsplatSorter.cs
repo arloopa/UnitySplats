@@ -63,8 +63,9 @@ namespace Gsplat
         {
             public uint[] Order = Array.Empty<uint>();
             public uint[] ScratchOrder = Array.Empty<uint>();
-            public byte[] Digits = Array.Empty<byte>();
-            public readonly int[] Histogram = new int[k_cpuSortRadix];
+            public uint[] Keys = Array.Empty<uint>();
+            public uint[] ScratchKeys = Array.Empty<uint>();
+            public readonly int[] Histograms = new int[k_cpuSortPasses * k_cpuSortRadix];
             public readonly int[] Offsets = new int[k_cpuSortRadix];
 
             public void EnsureCapacity(int count)
@@ -73,8 +74,10 @@ namespace Gsplat
                     Order = new uint[count];
                 if (ScratchOrder.Length < count)
                     ScratchOrder = new uint[count];
-                if (Digits.Length < count)
-                    Digits = new byte[count];
+                if (Keys.Length < count)
+                    Keys = new uint[count];
+                if (ScratchKeys.Length < count)
+                    ScratchKeys = new uint[count];
             }
         }
 
@@ -198,6 +201,7 @@ namespace Gsplat
             public bool UsesGpuSort => m_usesGpuSort;
             public GsplatAsset CpuAsset { get; private set; }
             public uint LastCpuRequestedCount { get; private set; } = uint.MaxValue;
+            Vector4 m_lastCpuDepthAxis;
 
             public Resource(uint count, GraphicsBuffer orderBuffer, bool useGpuSort, Texture2D orderTexture)
             {
@@ -418,17 +422,24 @@ namespace Gsplat
             }
 
             public void QueueCpuSort(Matrix4x4 matrixMv, uint requestedCount, bool force,
-                GsplatSkinningSnapshot skinning)
+                bool sortRequested, GsplatSkinningSnapshot skinning)
             {
                 if (m_usesGpuSort || m_disposed || m_cpuCenters == null)
                     return;
 
                 var selectableCount = m_activeSourceIds?.LongLength ?? m_cpuCenters.LongLength;
                 var count = (uint)Math.Min((long)requestedCount, selectableCount);
-                if (!force && count == LastCpuRequestedCount)
+                // The order depends only on the view-depth axis, the selected IDs and (when
+                // skinned) the pose. Resorting an unchanged view every frame cost a full sort per
+                // frame on Web, where this sort runs on the main thread. Selection and backend
+                // changes reset LastCpuRequestedCount, so they still sort.
+                var depthAxis = new Vector4(matrixMv.m20, matrixMv.m21, matrixMv.m22, matrixMv.m23);
+                bool viewUnchanged = skinning == null && depthAxis.Equals(m_lastCpuDepthAxis);
+                if (!force && count == LastCpuRequestedCount && (!sortRequested || viewUnchanged))
                     return;
 
                 LastCpuRequestedCount = count;
+                m_lastCpuDepthAxis = depthAxis;
                 if (count == 0)
                     return;
 
@@ -564,6 +575,9 @@ namespace Gsplat
                          m_cpuTask.Exception?.GetBaseException() is not OperationCanceledException)
                 {
                     Debug.LogException(m_cpuTask.Exception?.GetBaseException());
+                    // An unchanged view is not resubmitted, so a failed sort must not count as
+                    // the last request. Cancellation paths already reset this themselves.
+                    LastCpuRequestedCount = uint.MaxValue;
                 }
 
                 m_cpuCancellation?.Dispose();
@@ -1259,10 +1273,11 @@ namespace Gsplat
                     res.UpdateNativeTimingView(matrixV * gs.transform.localToWorldMatrix);
                 res.UpdateCpuWork();
                 var countChanged = gs.RemainingCount != res.LastCpuRequestedCount;
-                var forceSort = gs.ComputeSortRequired || !res.Initialized || cameraChanged;
-                if (forceSort || countChanged)
+                var forceSort = !res.Initialized || cameraChanged;
+                if (forceSort || countChanged || gs.ComputeSortRequired)
                     res.QueueCpuSort(matrixV * gs.transform.localToWorldMatrix, gs.RemainingCount,
-                        forceSort, (gs as GsplatRenderer)?.CaptureSkinningSnapshot());
+                        forceSort, gs.ComputeSortRequired,
+                        (gs as GsplatRenderer)?.CaptureSkinningSnapshot());
                 res.UpdateCpuWork();
             }
         }
@@ -1475,11 +1490,27 @@ namespace Gsplat
             CancellationToken cancellationToken)
         {
             double startedAt = GsplatWebSortDiagnostics.NowMs;
-            for (var i = 0; i < request.Count; ++i)
+            int count = request.Count;
+            uint[] sourceIds = workspace.Order;
+            uint[] sourceKeys = workspace.Keys;
+            int[] histograms = workspace.Histograms;
+            Array.Clear(histograms, 0, histograms.Length);
+
+            // Evaluate each depth once, in selection order, and gather every pass's digit
+            // histogram in the same sweep. The passes then carry keys with their IDs instead of
+            // re-reading centers in permuted (cache-hostile) order, which dominated sort time.
+            for (var i = 0; i < count; ++i)
             {
                 if ((i & k_cpuCancellationCheckMask) == 0)
                     cancellationToken.ThrowIfCancellationRequested();
-                workspace.Order[i] = request.SourceId(i);
+                uint sourceId = request.SourceId(i);
+                uint key = SortableDepthKey(request.Depth(sourceId));
+                sourceIds[i] = sourceId;
+                sourceKeys[i] = key;
+                histograms[key & 0xffu]++;
+                histograms[k_cpuSortRadix + (key >> 8 & 0xffu)]++;
+                histograms[2 * k_cpuSortRadix + (key >> 16 & 0xffu)]++;
+                histograms[3 * k_cpuSortRadix + (key >> 24)]++;
             }
 
             // Direct3D 11 and other wave-op-incompatible APIs use this CPU path. A stable LSD
@@ -1487,54 +1518,51 @@ namespace Gsplat
             // depth ordering and retention of source order when multiple centers have exactly
             // the same view depth. SPARK half-float centers make those ties common at particular
             // camera angles, where an unstable in-place partition produces localized artifacts.
-            var source = workspace.Order;
-            var destination = workspace.ScratchOrder;
-            for (var pass = 0; pass < k_cpuSortPasses; ++pass)
+            uint[] destinationIds = workspace.ScratchOrder;
+            uint[] destinationKeys = workspace.ScratchKeys;
+            int[] offsets = workspace.Offsets;
+            for (var pass = 0; pass < k_cpuSortPasses && count > 0; ++pass)
             {
-                Array.Clear(workspace.Histogram, 0, workspace.Histogram.Length);
-                var shift = pass * 8;
-
-                for (var i = 0; i < request.Count; ++i)
-                {
-                    if ((i & k_cpuCancellationCheckMask) == 0)
-                        cancellationToken.ThrowIfCancellationRequested();
-                    var digit = DepthDigit(request, source[i], shift);
-                    workspace.Digits[i] = (byte)digit;
-                    workspace.Histogram[digit]++;
-                }
+                int histogramStart = pass * k_cpuSortRadix;
+                int shift = pass * 8;
+                // When every key shares this digit the pass is the identity permutation, so
+                // skipping it saves a full scatter without affecting stability.
+                if (histograms[histogramStart + (int)(sourceKeys[0] >> shift & 0xffu)] == count)
+                    continue;
 
                 var offset = 0;
                 for (var digit = 0; digit < k_cpuSortRadix; ++digit)
                 {
-                    workspace.Offsets[digit] = offset;
-                    offset += workspace.Histogram[digit];
+                    offsets[digit] = offset;
+                    offset += histograms[histogramStart + digit];
                 }
 
                 // Forward scattering makes every radix pass stable. Equal full-depth keys
                 // therefore remain in their imported/selected order instead of being shuffled.
-                for (var i = 0; i < request.Count; ++i)
+                for (var i = 0; i < count; ++i)
                 {
                     if ((i & k_cpuCancellationCheckMask) == 0)
                         cancellationToken.ThrowIfCancellationRequested();
-                    var digit = workspace.Digits[i];
-                    destination[workspace.Offsets[digit]++] = source[i];
+                    uint key = sourceKeys[i];
+                    int position = offsets[key >> shift & 0xffu]++;
+                    destinationIds[position] = sourceIds[i];
+                    destinationKeys[position] = key;
                 }
 
-                (source, destination) = (destination, source);
+                (sourceIds, destinationIds) = (destinationIds, sourceIds);
+                (sourceKeys, destinationKeys) = (destinationKeys, sourceKeys);
             }
 
-            // Four byte passes leave the final result in the original Order array. Keep this
-            // defensive copy if the key width ever changes to an odd number of passes.
-            if (!ReferenceEquals(source, workspace.Order))
-                Array.Copy(source, workspace.Order, request.Count);
+            // Skipped passes can leave the result in the scratch array.
+            if (!ReferenceEquals(sourceIds, workspace.Order))
+                Array.Copy(sourceIds, workspace.Order, count);
 
-            return new CpuSortResult(request.Generation, request.Count,
+            return new CpuSortResult(request.Generation, count,
                 GsplatWebSortDiagnostics.NowMs - startedAt);
         }
 
-        static int DepthDigit(CpuSortRequest request, uint sourceId, int shift)
+        static uint SortableDepthKey(float depth)
         {
-            var depth = request.Depth(sourceId);
             // Invalid centers are rejected by package importers, but custom assets can still
             // provide NaNs. Sort them to the near/end side instead of allowing NaN sign bits to
             // place them unpredictably among valid splats.
@@ -1542,8 +1570,7 @@ namespace Gsplat
                 depth = float.PositiveInfinity;
             var bits = unchecked((uint)BitConverter.SingleToInt32Bits(depth));
             var mask = unchecked((uint)-(int)(bits >> 31)) | 0x80000000u;
-            var sortable = bits ^ mask;
-            return (int)(sortable >> shift & 0xffu);
+            return bits ^ mask;
         }
     }
 }

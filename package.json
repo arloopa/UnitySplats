@@ -6,7 +6,7 @@
   "description": "Cross-platform Gaussian Splatting renderer for Unity with PlayCanvas-compatible formats",
   "displayName": "UnitySplats",
   "name": "com.arloopa.unitysplats",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "unity": "6000.0",
   "license": "MIT",
   "repository": {
